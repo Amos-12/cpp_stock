@@ -7,6 +7,12 @@ import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { 
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { 
   ShoppingCart, 
   Package, 
   Search,
@@ -17,11 +23,14 @@ import {
   ArrowRight,
   AlertCircle,
   FileText,
-  Printer
+  Printer,
+  Trash2,
+  ChevronDown
 } from 'lucide-react';
 import { supabase } from '@/integrations/supabase/client';
 import { toast } from '@/hooks/use-toast';
 import { useAuth } from '@/hooks/useAuth';
+import { generateReceipt, generateInvoice } from '@/lib/pdfGenerator';
 import jsPDF from 'jspdf';
 import logo from '@/assets/logo.png';
 
@@ -48,6 +57,7 @@ interface Product {
   prix_par_barre?: number;
   stock_barre?: number;
   decimal_autorise?: boolean;
+  bars_per_ton?: number;  // Number of bars per metric ton (for iron category)
   // Energy-specific fields
   type_energie?: any;
   puissance?: any;
@@ -66,6 +76,8 @@ interface CartItem extends Product {
   cartQuantity: number;
   displayUnit?: string; // For ceramics: "m²", For iron: "barre"
   actualPrice?: number; // Calculated price for ceramics
+  sourceUnit?: 'barre' | 'tonne'; // Track original input unit for iron
+  sourceValue?: number; // Track original input value for iron
 }
 
 type WorkflowStep = 'products' | 'cart' | 'checkout' | 'success';
@@ -93,6 +105,7 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
   const [completedSale, setCompletedSale] = useState<any>(null);
   const [customQuantityDialog, setCustomQuantityDialog] = useState<{open: boolean, product: Product | null}>({open: false, product: null});
   const [customQuantityValue, setCustomQuantityValue] = useState('');
+  const [quantityUnit, setQuantityUnit] = useState<'barre' | 'tonne'>('barre'); // Track selected unit for iron
   const [paymentMethod, setPaymentMethod] = useState<'espece' | 'cheque' | 'virement'>('espece');
   const [companySettings, setCompanySettings] = useState<any>(null);
 
@@ -104,6 +117,39 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
       useGrouping: true
     }).replace(/\s/g, ' '); // Ensure space separator
     return currency ? `${formatted} HTG` : formatted;
+  };
+
+  // Utility function to convert decimal tonnage to fractional display
+  const getTonnageLabel = (tonnage: number): string => {
+    const integerPart = Math.floor(tonnage);
+    const decimalPart = tonnage - integerPart;
+    
+    let fractionStr = '';
+    if (Math.abs(decimalPart - 0.25) < 0.01) {
+      fractionStr = '1/4';
+    } else if (Math.abs(decimalPart - 0.5) < 0.01) {
+      fractionStr = '1/2';
+    } else if (Math.abs(decimalPart - 0.75) < 0.01) {
+      fractionStr = '3/4';
+    } else if (decimalPart > 0.01) {
+      fractionStr = decimalPart.toFixed(2);
+    }
+    
+    if (integerPart > 0) {
+      return fractionStr ? `${integerPart} ${fractionStr} tonne${tonnage > 1 ? 's' : ''}` : `${integerPart} tonne${integerPart > 1 ? 's' : ''}`;
+    } else {
+      return fractionStr ? `${fractionStr} tonne` : `${tonnage.toFixed(2)} tonne${tonnage > 1 ? 's' : ''}`;
+    }
+  };
+
+  // Convert tonnage to number of bars based on bars_per_ton (ROUNDED TO INTEGER)
+  const tonnageToBarres = (tonnage: number, barsPerTon: number): number => {
+    return Math.round(tonnage * barsPerTon); // Always return integer bars
+  };
+
+  // Convert bars to tonnage for display
+  const barresToTonnage = (barres: number, barsPerTon: number): number => {
+    return barres / barsPerTon;
   };
 
   // Load company settings once on mount
@@ -230,22 +276,26 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
     }
   };
 
-  const addToCart = (product: Product, customQty?: number) => {
+  const addToCart = (product: Product, customQty?: number, inputUnit?: 'barre' | 'tonne') => {
     // For ceramics, open dialog to get m² needed
     if (product.category === 'ceramique' && !customQty) {
       setCustomQuantityDialog({open: true, product});
+      setQuantityUnit('barre'); // Reset unit
       return;
     }
 
-    // For iron bars, add directly in barres
+    // For iron bars, open dialog if no custom quantity provided
     if (product.category === 'fer' && !customQty) {
       setCustomQuantityDialog({open: true, product});
+      setQuantityUnit('barre'); // Default to barre
       return;
     }
 
     let quantityToAdd = customQty || 1;
     let actualPrice = product.price;
     let displayUnit = product.unit;
+    let sourceUnit: 'barre' | 'tonne' | undefined;
+    let sourceValue: number | undefined;
 
     // Calculate for ceramics
     if (product.category === 'ceramique' && product.surface_par_boite && product.prix_m2) {
@@ -257,11 +307,32 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
       displayUnit = `m² (${boxesNeeded} boîtes)`;
     }
 
-    // Calculate for iron bars
+    // Calculate for iron bars - handle BOTH barre and tonne inputs
     if (product.category === 'fer' && product.prix_par_barre) {
-      quantityToAdd = customQty || 1;
-      actualPrice = product.prix_par_barre * quantityToAdd;
-      displayUnit = 'barre';
+      if (inputUnit === 'tonne') {
+        // User selected tonnage input
+        if (!product.bars_per_ton) {
+          toast({
+            title: "Configuration manquante",
+            description: "Barres/tonne non défini pour ce diamètre. Impossible d'utiliser l'unité tonne.",
+            variant: "destructive"
+          });
+          return;
+        }
+        const tonnageInput = customQty || 0;
+        quantityToAdd = tonnageToBarres(tonnageInput, product.bars_per_ton); // Convert to INTEGER bars
+        actualPrice = product.prix_par_barre * quantityToAdd; // Price per bar * number of bars
+        displayUnit = 'barre'; // Standardize display unit
+        sourceUnit = 'tonne';
+        sourceValue = tonnageInput;
+      } else {
+        // User selected barres input (default)
+        quantityToAdd = Math.max(1, Math.round(customQty || 1)); // Ensure integer
+        actualPrice = product.prix_par_barre * quantityToAdd;
+        displayUnit = 'barre';
+        sourceUnit = 'barre';
+        sourceValue = quantityToAdd;
+      }
     }
     
     // Calculate for vêtements - standard pricing
@@ -271,19 +342,31 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
       displayUnit = product.unit;
     }
 
+    // Get available stock based on category
+    const availableStock = product.category === 'ceramique' ? (product.stock_boite || 0) : 
+                          product.category === 'fer' ? (product.stock_barre || 0) : 
+                          product.quantity;
+
+    // For iron, validate against stock in bars
+    if (product.category === 'fer' && quantityToAdd > availableStock) {
+      toast({
+        title: "Stock insuffisant",
+        description: `Stock disponible: ${availableStock} barres`,
+        variant: "destructive"
+      });
+      return;
+    }
+
     setCart(prevCart => {
       const existingItem = prevCart.find(item => item.id === product.id);
       
       if (existingItem) {
         const newCartQuantity = existingItem.cartQuantity + quantityToAdd;
-        const availableStock = product.category === 'ceramique' ? (product.stock_boite || 0) : 
-                                product.category === 'fer' ? (product.stock_barre || 0) : 
-                                product.quantity;
         
         if (newCartQuantity > availableStock) {
           toast({
             title: "Stock insuffisant",
-            description: `Stock disponible : ${availableStock} ${displayUnit}`,
+            description: `Stock disponible : ${availableStock} ${product.category === 'fer' ? 'barres' : displayUnit}`,
             variant: "destructive"
           });
           return prevCart;
@@ -291,21 +374,43 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
         
         return prevCart.map(item =>
           item.id === product.id
-            ? { ...item, cartQuantity: newCartQuantity, actualPrice, displayUnit }
+            ? { 
+                ...item, 
+                cartQuantity: newCartQuantity, 
+                actualPrice: product.category === 'fer' && product.prix_par_barre 
+                  ? product.prix_par_barre * newCartQuantity 
+                  : actualPrice,
+                displayUnit,
+                sourceUnit,
+                sourceValue
+              }
             : item
         );
       } else {
+        // Validate stock for new items
+        if (quantityToAdd > availableStock) {
+          toast({
+            title: "Stock insuffisant",
+            description: `Quantité demandée : ${quantityToAdd}\nStock disponible : ${availableStock} ${product.category === 'fer' ? 'barres' : displayUnit}`,
+            variant: "destructive"
+          });
+          return prevCart;
+        }
+        
         return [...prevCart, { 
           ...product, 
           cartQuantity: quantityToAdd,
           actualPrice,
-          displayUnit
+          displayUnit,
+          sourceUnit,
+          sourceValue
         }];
       }
     });
 
     setCustomQuantityDialog({open: false, product: null});
     setCustomQuantityValue('');
+    setQuantityUnit('barre'); // Reset to default
   };
 
   const handleCustomQuantitySubmit = () => {
@@ -322,7 +427,20 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
       return;
     }
 
-    addToCart(product, qty);
+    // Pass the selected unit for iron products
+    if (product.category === 'fer') {
+      addToCart(product, qty, quantityUnit);
+    } else {
+      addToCart(product, qty);
+    }
+  };
+
+  const removeFromCart = (productId: string) => {
+    setCart(prevCart => prevCart.filter(item => item.id !== productId));
+    toast({
+      title: "Article retiré",
+      description: "L'article a été supprimé du panier",
+    });
   };
 
   const updateQuantity = (productId: string, change: number) => {
@@ -359,10 +477,11 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
             displayUnit = `m² (${newQuantity} boîtes)`;
           }
           
-          // Recalculate for iron bars
+          // Recalculate for iron bars (always work with integer bars)
           else if (item.category === 'fer' && item.prix_par_barre) {
             actualPrice = item.prix_par_barre * newQuantity;
             displayUnit = 'barre';
+            // Preserve source unit info if it exists
           }
           
           // Recalculate for clothing - standard pricing
@@ -415,6 +534,28 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
       const discountAmount = getDiscountAmount();
       const totalAmount = getFinalTotal();
 
+      // Validate cart items before sending
+      const invalidItems = cart.filter(item => {
+        if (item.category === 'fer') {
+          const availableStock = item.stock_barre || 0;
+          if (item.cartQuantity > availableStock) {
+            return true;
+          }
+        }
+        return false;
+      });
+
+      if (invalidItems.length > 0) {
+        const itemNames = invalidItems.map(i => i.name).join(', ');
+        throw new Error(`Stock insuffisant pour: ${itemNames}. Veuillez ajuster les quantités.`);
+      }
+
+      console.log('✅ Cart validation passed:', {
+        itemCount: cart.length,
+        totalAmount: totalAmount,
+        hasDiscount: discountType !== 'none'
+      });
+
       // Prepare sale data for Edge Function
       const saleRequest = {
         customer_name: customerName.trim() || null,
@@ -428,12 +569,14 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
         items: cart.map(item => ({
           product_id: item.id,
           product_name: item.name,
-          quantity: item.cartQuantity,
-          unit: item.displayUnit || item.unit,
+          quantity: Math.round(item.cartQuantity), // ALWAYS INTEGER for database
+          unit: item.category === 'fer' ? 'barre' : (item.displayUnit || item.unit), // Force 'barre' for iron
           unit_price: item.actualPrice !== undefined ? item.actualPrice / item.cartQuantity : item.price,
           subtotal: item.actualPrice !== undefined ? item.actualPrice : (item.price * item.cartQuantity)
         }))
       };
+
+      console.log('📦 Sale payload:', JSON.stringify(saleRequest, null, 2));
 
       // Get the current session to pass auth token
       const { data: { session } } = await supabase.auth.getSession();
@@ -450,7 +593,15 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
         }
       });
 
-      if (error) throw error;
+      if (error) {
+        console.error('🔴 Edge Function Error Details:', {
+          message: error.message,
+          details: error.details,
+          hint: error.hint,
+          code: error.code
+        });
+        throw new Error(`Erreur serveur (${error.code || 'UNKNOWN'}): ${error.message || 'Service temporairement indisponible. Réessayez dans quelques instants.'}`);
+      }
       
       if (!data.success) {
         throw new Error(data.error || 'Échec du traitement de la vente');
@@ -488,12 +639,55 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
       onSaleComplete?.();
 
     } catch (error) {
-      console.error('Error processing sale:', error);
-      const errorMessage = error instanceof Error ? error.message : "Impossible d'enregistrer la vente";
+      console.error('🔴 Erreur détaillée lors du traitement de la vente:', error);
+      console.error('🔴 Stack trace:', error instanceof Error ? error.stack : 'N/A');
+      console.error('🔴 Cart contents:', JSON.stringify(cart, null, 2));
+      
+      let errorTitle = "❌ Échec de la vente";
+      let errorDescription = "";
+      
+      if (error instanceof Error) {
+        const errorMsg = error.message.toLowerCase();
+        
+        // Quantité invalide (22P02 error)
+        if (errorMsg.includes('22p02') || errorMsg.includes('invalid input syntax for type integer')) {
+          errorTitle = "❌ Quantité invalide";
+          errorDescription = "Quantité invalide (décimale) détectée. Les barres doivent être entières. Utilisez les boutons tonne: ils arrondissent automatiquement au nombre de barres.";
+        }
+        // Stock insuffisant
+        else if (errorMsg.includes('stock') || errorMsg.includes('insufficient')) {
+          errorTitle = "❌ Stock insuffisant";
+          errorDescription = `Un ou plusieurs produits n'ont pas assez de stock disponible.\n\nDétails: ${error.message}`;
+        } 
+        // Problème de session/authentification
+        else if (errorMsg.includes('session') || errorMsg.includes('auth') || errorMsg.includes('token')) {
+          errorTitle = "🔐 Erreur d'authentification";
+          errorDescription = `Votre session a expiré. Veuillez vous reconnecter et réessayer.\n\nDétails: ${error.message}`;
+        } 
+        // Problème réseau
+        else if (errorMsg.includes('network') || errorMsg.includes('fetch') || errorMsg.includes('connection')) {
+          errorTitle = "🌐 Problème de connexion";
+          errorDescription = `Impossible de contacter le serveur. Vérifiez votre connexion internet.\n\nDétails: ${error.message}`;
+        }
+        // Erreur serveur
+        else if (errorMsg.includes('serveur') || errorMsg.includes('server') || errorMsg.includes('service')) {
+          errorTitle = "⚠️ Erreur serveur";
+          errorDescription = `Le serveur a rencontré une erreur lors du traitement.\n\nDétails: ${error.message}\n\nVeuillez réessayer dans quelques instants.`;
+        }
+        // Erreur inconnue
+        else {
+          errorTitle = "❌ Erreur inattendue";
+          errorDescription = `Une erreur s'est produite lors de l'enregistrement de la vente.\n\n📋 Détails techniques:\n${error.message}\n\n💡 Suggestion: Vérifiez les logs de la console (F12) pour plus d'informations.`;
+        }
+      } else {
+        errorDescription = "Erreur inconnue. Contactez le support technique.";
+      }
+      
       toast({
-        title: "Erreur",
-        description: errorMessage,
-        variant: "destructive"
+        title: errorTitle,
+        description: errorDescription,
+        variant: "destructive",
+        duration: 8000, // 8 secondes pour lire
       });
     } finally {
       setIsProcessing(false);
@@ -515,547 +709,57 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
     onSaleComplete?.();
   };
 
-  const printReceipt = async () => {
+  const printReceipt58mm = async () => {
     if (!completedSale || !companySettings) return;
     
-    try {
-      // Format 58mm largeur pour imprimante thermique
-      const receiptWidth = 58;
-      
-      const items = completedSale.items || [];
-      
-      // Calcul dynamique de la hauteur des infos client
-      const customerInfoHeight = 
-        (completedSale.customer_name ? 3 : 0) + 
-        (completedSale.customer_address ? 3 : 0);
-      
-      // Calcul dynamique de la hauteur des items
-      const itemsHeight = items.reduce((total: number, item: any) => {
-        let itemHeight = 6; // hauteur de base du nom du produit + ligne prix
-        
-        // Si dimension ou diamètre, ajouter une ligne
-        if (item.dimension || item.diametre) {
-          itemHeight += 3;
-        }
-        
-        // Si longueur en pieds pour le fer, ajouter une ligne
-        const ironProd = cart.find((p: any) => p.name === item.name);
-        if (ironProd?.longueur_barre_ft && ironProd.category === 'fer') {
-          itemHeight += 3;
-        }
-        
-        // Si bloc_type, ajouter une ligne
-        if (item.bloc_type) {
-          itemHeight += 3;
-        }
-        
-        // Si vêtements (taille ou couleur), ajouter une ligne
-        if (item.vetement_taille || item.vetement_couleur) {
-          itemHeight += 3;
-        }
-        
-        return total + itemHeight;
-      }, 0);
-      
-      // Calcul du footer
-      const hasDiscount = completedSale.discount_amount && completedSale.discount_amount > 0;
-      const footerHeight = 30 + (hasDiscount ? 3 : 0); // +3 si remise
-      
-      const headerHeight = 55; // Légèrement augmenté
-      const dynamicHeight = headerHeight + customerInfoHeight + itemsHeight + footerHeight + 15; // +15 marge sécurité
-      
-      const pdf = new jsPDF({
-        orientation: 'portrait',
-        unit: 'mm',
-        format: [receiptWidth, dynamicHeight]
-      });
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('full_name')
+      .eq('user_id', user?.id)
+      .single();
+    
+    generateReceipt(
+      completedSale,
+      companySettings,
+      cart,
+      profile?.full_name || 'Vendeur',
+      58
+    );
+  };
 
-      const margin = 3;
-      const contentWidth = receiptWidth - (margin * 2);
-      let currentY = margin;
-
-      // Add logo image - use company logo if available, otherwise default
-      try {
-        const logoWidth = 18;
-        const logoHeight = 18;
-        const logoX = (receiptWidth - logoWidth) / 2;
-        const logoToUse = companySettings.logo_url || logo;
-        pdf.addImage(logoToUse, 'PNG', logoX, currentY, logoWidth, logoHeight);
-        currentY += logoHeight + 3;
-      } catch (e) {
-        console.error('Error adding logo:', e);
-        currentY += 3;
-      }
-      
-      // Company Header - Dynamic from settings
-      pdf.setFontSize(8);
-      pdf.setFont('helvetica', 'bold');
-      pdf.text(companySettings.company_name, contentWidth / 2 + margin, currentY, { align: 'center' });
-      currentY += 3;
-      pdf.setFontSize(6);
-      pdf.setFont('helvetica', 'normal');
-      pdf.text(companySettings.address, contentWidth / 2 + margin, currentY, { align: 'center' });
-      currentY += 2.5;
-      pdf.text(companySettings.city, contentWidth / 2 + margin, currentY, { align: 'center' });
-      currentY += 2.5;
-      pdf.text(`Tel: ${companySettings.phone}`, contentWidth / 2 + margin, currentY, { align: 'center' });
-      currentY += 2.5;
-      pdf.text(companySettings.email, contentWidth / 2 + margin, currentY, { align: 'center' });
-      currentY += 3;
-      pdf.text('-------------------------------', contentWidth / 2 + margin, currentY, { align: 'center' });
-      
-      // Invoice Info
-      currentY += 4;
-      pdf.setFontSize(7);
-      const createdAt = new Date(completedSale.created_at || Date.now());
-      const pad = (n: number) => n.toString().padStart(2, '0');
-      const codeStamp = `${createdAt.getFullYear()}${pad(createdAt.getMonth()+1)}${pad(createdAt.getDate())}${pad(createdAt.getHours())}${pad(createdAt.getMinutes())}${pad(createdAt.getSeconds())}`;
-      const receiptCode = `REC-${codeStamp}`;
-      pdf.text(`No: ${receiptCode}`, margin, currentY);
-      currentY += 3;
-      const dateStr = `${pad(createdAt.getDate())}/${pad(createdAt.getMonth()+1)}/${createdAt.getFullYear()} ${pad(createdAt.getHours())}:${pad(createdAt.getMinutes())}`;
-      pdf.text(`Date: ${dateStr}`, margin, currentY);
-      
-      // Space before customer info
-      currentY += 4;
-      pdf.text('-------------------------------', contentWidth / 2 + margin, currentY, { align: 'center' });
-      
-      // Customer Info Section
-      currentY += 4;
-      if (completedSale.customer_name) {
-        pdf.text(`Client: ${completedSale.customer_name.substring(0, 30)}`, margin, currentY);
-        currentY += 3;
-      }
-      if (completedSale.customer_address) {
-        pdf.text(`Adresse: ${String(completedSale.customer_address).substring(0, 38)}`, margin, currentY);
-        currentY += 3;
-      }
-      
-      
-      // Items Header
-      currentY += 4;
-      pdf.setFontSize(7);
-      pdf.setFont('helvetica', 'bold');
-      pdf.text('Article', margin, currentY);
-      pdf.text('Qte', contentWidth - 30, currentY);
-      pdf.text('Prix', contentWidth - 20, currentY);
-      pdf.text('Total', contentWidth - 1, currentY, { align: 'right' });
-      
-      currentY += 2;
-      pdf.setFont('helvetica', 'normal');
-      
-      // Items - Dynamic with all product details
-      items.forEach((item: any) => {
-        currentY += 3;
-        
-        // Product name
-        let itemName = item.name;
-        if (itemName.length > 18) {
-          itemName = itemName.substring(0, 18) + '...';
-        }
-        pdf.setFontSize(6);
-        pdf.text(itemName, margin, currentY);
-        
-        // Add dimension or diameter on next line if available
-        if (item.dimension || item.diametre) {
-          currentY += 2.5;
-          pdf.setFontSize(5);
-          const detail = item.dimension ? `(${item.dimension})` : `(Ø ${item.diametre})`;
-          pdf.text(detail, margin + 1, currentY);
-          pdf.setFontSize(6);
-          currentY += 0.5;
-        }
-        
-        // Add longueur for iron bars
-        const ironProduct = cart.find(p => p.name === item.name);
-        if (ironProduct?.longueur_barre_ft && ironProduct.category === 'fer') {
-          currentY += 2.5;
-          pdf.setFontSize(5);
-          pdf.text(`(${ironProduct.longueur_barre_ft} ft)`, margin + 1, currentY);
-          pdf.setFontSize(6);
-          currentY += 0.5;
-        }
-        
-        // Add bloc type
-        if (item.bloc_type) {
-          currentY += 2.5;
-          pdf.setFontSize(5);
-          pdf.text(`(Type: ${item.bloc_type})`, margin + 1, currentY);
-          pdf.setFontSize(6);
-          currentY += 0.5;
-        }
-        
-        // Add vêtements details
-        if (item.vetement_taille || item.vetement_couleur) {
-          currentY += 2.5;
-          pdf.setFontSize(5);
-          const details = [];
-          if (item.vetement_taille) details.push(`T:${item.vetement_taille}`);
-          if (item.vetement_couleur) details.push(item.vetement_couleur);
-          pdf.text(details.join(' - '), margin + 1, currentY);
-          pdf.setFontSize(6);
-          currentY += 0.5;
-        }
-        
-        // Quantity, Price, Total on the product name line
-        const baseY = item.dimension || item.diametre ? currentY - 3 : currentY;
-        pdf.text(item.quantity.toString(), contentWidth - 30, baseY);
-        pdf.text(`${formatAmount(item.unit_price, false)}`, contentWidth - 20, baseY);
-        pdf.text(`${formatAmount(item.total, false)}`, contentWidth - 2 + margin, baseY, { align: 'right' });
-      });
-      
-      currentY += 3;
-      pdf.text('-------------------------------', contentWidth / 2 + margin, currentY, { align: 'center' });
-      
-      // Subtotal (no TVA on receipt)
-      currentY += 4;
-      pdf.setFontSize(7);
-      pdf.setFont('helvetica', 'normal');
-      pdf.text('Sous-total:', margin, currentY);
-      pdf.text(`${formatAmount(completedSale.subtotal, false)} HTG`, contentWidth - 2 + margin, currentY, { align: 'right' });
-      
-      // Discount (if applicable)
-      if (completedSale.discount_amount && completedSale.discount_amount > 0) {
-        currentY += 3;
-        pdf.text(`Remise (${completedSale.discount_type === 'percentage' ? completedSale.discount_value + '%' : 'fixe'}):`, margin, currentY);
-        pdf.text(`-${formatAmount(completedSale.discount_amount, false)} HTG`, contentWidth - 2 + margin, currentY, { align: 'right' });
-      }
-      
-      currentY += 3;
-      pdf.text('-------------------------------', contentWidth / 2 + margin, currentY, { align: 'center' });
-      
-      // Total (no TVA displayed on receipt)
-      currentY += 4;
-      pdf.setFontSize(9);
-      pdf.setFont('helvetica', 'bold');
-      pdf.text('TOTAL:', margin, currentY);
-      pdf.text(`${formatAmount(completedSale.total_amount, false)} HTG`, contentWidth - 2 + margin, currentY, { align: 'right' });
-      
-      currentY += 4;
-      pdf.setFontSize(6);
-      pdf.setFont('helvetica', 'normal');
-      const paymentLabel = completedSale.payment_method === 'espece' ? 'Espèce' : completedSale.payment_method === 'cheque' ? 'Chèque' : completedSale.payment_method === 'virement' ? 'Virement' : String(completedSale.payment_method);
-      pdf.text(`Paiement: ${paymentLabel}`, margin, currentY);
-      
-      currentY += 3;
-      pdf.text('-------------------------------', contentWidth / 2 + margin, currentY, { align: 'center' });
-      
-      // Footer
-      currentY += 3;
-      pdf.setFont('helvetica', 'italic');
-      pdf.setFontSize(5);
-      pdf.text(`Merci d'avoir choisi ${companySettings.company_name} !`, contentWidth / 2 + margin, currentY, { align: 'center'});
-
-      // Save and auto-print
-      const fileName = `${receiptCode}.pdf`;
-      pdf.save(fileName);
-
-      setTimeout(() => {
-        window.print();
-      }, 500);
-
-      toast({
-        title: "Reçu imprimé",
-        description: "Le reçu a été généré et envoyé à l'impression"
-      });
-
-    } catch (error) {
-      console.error('Error printing receipt:', error);
-      toast({
-        title: "Erreur",
-        description: "Impossible d'imprimer le reçu",
-        variant: "destructive"
-      });
-    }
+  const printReceipt80mm = async () => {
+    if (!completedSale || !companySettings) return;
+    
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('full_name')
+      .eq('user_id', user?.id)
+      .single();
+    
+    generateReceipt(
+      completedSale,
+      companySettings,
+      cart,
+      profile?.full_name || 'Vendeur',
+      80
+    );
   };
 
   const printInvoice = async () => {
     if (!completedSale || !companySettings) return;
     
-    try {
-      const pdf = new jsPDF({
-        orientation: 'portrait',
-        unit: 'mm',
-        format: 'a4'
-      });
-
-      const pageWidth = 210;
-      const pageHeight = 297;
-      const margin = 20;
-      const contentWidth = pageWidth - (margin * 2);
-      let currentY = margin;
-
-      // Add logo image - use company logo if available, otherwise default
-      try {
-        const logoSize = 36;
-        const logoToUse = companySettings.logo_url || logo;
-        pdf.addImage(logoToUse, 'PNG', margin, currentY, logoSize, logoSize);
-      } catch (e) {
-        console.error('Error adding logo to invoice:', e);
-      }
-
-      // Invoice number and dates on the right
-      const createdAt = new Date(completedSale.created_at || Date.now());
-      const pad = (n: number) => n.toString().padStart(2, '0');
-      const invoiceSeq = `${createdAt.getFullYear()}${pad(createdAt.getMonth()+1)}${pad(createdAt.getDate())}${pad(createdAt.getHours())}${pad(createdAt.getMinutes())}${pad(createdAt.getSeconds())}`;
-      const invoiceNumber = `FACT-${invoiceSeq}`;
-      
-      pdf.setFontSize(14);
-      pdf.setFont('helvetica', 'bold');
-      pdf.setTextColor(0, 0, 0);
-      pdf.text(invoiceNumber, pageWidth - margin, currentY, { align: 'right' });
-      
-      currentY += 4;
-      pdf.setFontSize(9);
-      pdf.setFont('helvetica', 'normal');
-      const dateStr = `${pad(createdAt.getDate())}/${pad(createdAt.getMonth()+1)}/${createdAt.getFullYear()}`;
-      pdf.text(`Date de facturation: ${dateStr}`, pageWidth - margin, currentY, { align: 'right' });
-      
-      // Company information on the left - Dynamic from settings
-      currentY = margin + 42;
-      pdf.setFontSize(12);
-      pdf.setFont('helvetica', 'bold');
-      pdf.setTextColor(0, 0, 0);
-      pdf.text(companySettings.company_name, margin, currentY);
-      
-      currentY += 4;
-      pdf.setFont('helvetica', 'normal');
-      pdf.setFontSize(8);
-      pdf.setTextColor(80, 80, 80);
-      pdf.text(companySettings.company_description, margin, currentY);
-      
-      currentY += 5;
-      pdf.setFontSize(9);
-      pdf.text(companySettings.address, margin, currentY);
-      
-      currentY += 4;
-      pdf.text(companySettings.city, margin, currentY);
-      
-      currentY += 4;
-      pdf.text(companySettings.phone, margin, currentY);
-      
-      currentY += 4;
-      pdf.text(companySettings.email, margin, currentY);
-
-      // Customer information (if provided)
-      currentY = margin + 72;
-      if (completedSale.customer_name || completedSale.customer_address) {
-        pdf.setFontSize(9);
-        pdf.setFont('helvetica', 'bold');
-        pdf.setTextColor(0, 0, 0);
-        pdf.text('Information Client :', margin, currentY);
-        
-        currentY += 5;
-        pdf.setFont('helvetica', 'normal');
-        if (completedSale.customer_name) {
-          pdf.text(completedSale.customer_name, margin, currentY);
-          currentY += 4;
-        }
-        if (completedSale.customer_address) {
-          pdf.text(completedSale.customer_address, margin, currentY);
-          currentY += 4;
-        }
-        currentY += 4;
-      }
-
-      // Thank you message - Dynamic
-      pdf.setFontSize(10);
-      pdf.setFont('helvetica', 'italic');
-      pdf.setTextColor(80, 80, 80);
-      pdf.text(`Merci d'avoir choisi ${companySettings.company_name} !`, margin, currentY);
-      
-      currentY += 4;
-
-      // Table header with gray background
-      pdf.setFillColor(220, 220, 220);
-      pdf.rect(margin, currentY, contentWidth, 8, 'F');
-      
-      pdf.setDrawColor(180, 180, 180);
-      pdf.setLineWidth(0.3);
-      pdf.rect(margin, currentY, contentWidth, 8);
-
-      pdf.setFontSize(9);
-      pdf.setFont('helvetica', 'bold');
-      pdf.setTextColor(0, 0, 0);
-
-      const colX = {
-        description: margin + 2,
-        quantity: margin + 65,
-        unit: margin + 85,
-        unitPrice: margin + 115,
-        total: margin + 150
-      };
-
-      currentY += 5.5;
-      pdf.text('Description', colX.description, currentY);
-      pdf.text('Qté', colX.quantity, currentY);
-      pdf.text('Unité', colX.unit, currentY);
-      pdf.text('Prix unitaire', colX.unitPrice, currentY);
-      pdf.text('Montant', colX.total, currentY);
-
-      currentY += 2.5;
-      
-      // Items
-      const items = completedSale.items || [];
-      pdf.setFont('helvetica', 'normal');
-      pdf.setFontSize(8);
-      
-      items.forEach((item: any) => {
-        const rowHeight = 6;
-        currentY += rowHeight;
-        
-        // Build description
-        let description = item.name;
-        const details = [];
-        
-        if (item.dimension) details.push(item.dimension);
-        if (item.diametre) details.push(`Ø ${item.diametre}`);
-        const ironProd = cart.find(p => p.name === item.name);
-        if (ironProd?.longueur_barre_ft && ironProd.category === 'fer') {
-          details.push(`${ironProd.longueur_barre_ft} ft`);
-        }
-        
-        // For energy category, add specific fields
-        const energyProd = cart.find(p => p.name === item.name);
-        if (energyProd?.category === 'energie') {
-          if (energyProd.type_energie) details.push(`Type: ${energyProd.type_energie}`);
-          if (energyProd.puissance) details.push(`${energyProd.puissance}W`);
-          if (energyProd.voltage) details.push(`${energyProd.voltage}V`);
-          if (energyProd.capacite) details.push(`${energyProd.capacite}`);
-        }
-        
-        if (details.length > 0) {
-          description += ` (${details.join(', ')})`;
-        }
-        
-        // Wrap long descriptions - reduced length due to narrower column
-        if (description.length > 40) {
-          description = description.substring(0, 38) + '...';
-        }
-        
-        pdf.setTextColor(0, 0, 0);
-        pdf.text(description, colX.description, currentY);
-        pdf.text(item.quantity.toString(), colX.quantity, currentY);
-        pdf.text(item.unit || 'pce', colX.unit, currentY);
-        pdf.text(`${formatAmount(item.unit_price, false)} HTG`, colX.unitPrice, currentY);
-        pdf.text(`${formatAmount(item.total, false)} HTG`, colX.total, currentY);
-      });
-
-      // Totals section
-      currentY += 10;
-      const totalStartY = currentY;
-      
-      // Calculate totals - Dynamic TVA from settings
-      const subtotalBeforeDiscount = completedSale.subtotal || completedSale.total_amount;
-      const discountAmount = completedSale.discount_amount || 0;
-      const totalHT = subtotalBeforeDiscount - discountAmount;
-      const tvaRate = companySettings.tva_rate / 100;
-      const tvaAmount = totalHT * tvaRate;
-      const totalTTC = totalHT + tvaAmount;
-      
-      pdf.setFont('aptos', 'bold');
-      pdf.setFontSize(10);
-      
-      const totalsX = colX.unitPrice;
-      
-      // Total HT (before discount)
-      pdf.text('Total HT', totalsX, currentY, { align: 'right' });
-      pdf.text(`${formatAmount(subtotalBeforeDiscount, false)} HTG`, pageWidth - margin, currentY, { align: 'right' });
-      
-      // Discount (if applicable)
-      if (discountAmount > 0) {
-        currentY += 6;
-        const discountLabel = completedSale.discount_type === 'percentage' 
-          ? `Remise (${completedSale.discount_value}%)` 
-          : 'Remise';
-        pdf.setTextColor(220, 38, 38); // Red for discount
-        pdf.text(discountLabel, totalsX, currentY, { align: 'right' });
-        pdf.text(`-${formatAmount(discountAmount, false)} HTG`, pageWidth - margin, currentY, { align: 'right' });
-        pdf.setTextColor(0, 0, 0); // Reset color
-        
-        // Total after discount
-        currentY += 6;
-        pdf.text('Total après remise', totalsX, currentY, { align: 'right' });
-        pdf.text(`${formatAmount(totalHT, false)} HTG`, pageWidth - margin, currentY, { align: 'right' });
-      }
-      
-      currentY += 6;
-      // TVA with dynamic rate
-      pdf.text(`TVA ${companySettings.tva_rate.toFixed(1)} %`, totalsX, currentY, { align: 'right' });
-      pdf.text(`${formatAmount(tvaAmount, false)} HTG`, pageWidth - margin, currentY, { align: 'right' });
-      
-      // Line before Total TTC
-      currentY += 2;
-      pdf.setDrawColor(0, 0, 0);
-      pdf.setLineWidth(0.5);
-      pdf.line(totalsX, currentY, pageWidth - margin, currentY);
-      
-      currentY += 6;
-      // Total TTC
-      pdf.setFontSize(12);
-      pdf.text('Total TTC', totalsX, currentY, { align: 'right' });
-      pdf.text(`${formatAmount(totalTTC, false)} HTG`, pageWidth - margin, currentY, { align: 'right' });
-
-      // Payment information
-      currentY += 6;
-      pdf.setFontSize(9);
-      pdf.setFont('helvetica', 'bold');
-      pdf.text('Moyens de paiement:', margin, currentY);
-      
-      pdf.setFont('helvetica', 'normal');
-      const paymentMethodLabel = {
-        espece: 'Espèces',
-        cheque: 'Chèque',
-        virement: 'Virement bancaire'
-      }[completedSale.payment_method] || completedSale.payment_method || 'Espèces';
-      pdf.text(paymentMethodLabel, margin + 33, currentY);
-      
-      // Payment terms from company settings
-      if (companySettings.payment_terms) {
-        currentY += 8;
-        pdf.setFont('helvetica', 'bold');
-        pdf.text('Conditions de paiement:', margin, currentY);
-        
-        pdf.setFont('helvetica', 'normal');
-        const termsLines = pdf.splitTextToSize(companySettings.payment_terms, pageWidth - margin * 2 - 50);
-        termsLines.forEach((line: string) => {
-          pdf.text(line, margin + 38, currentY);
-          currentY += 4;
-        });
-      }
-
-      // Footer - Dynamic from settings
-      currentY = pageHeight - 20;
-      pdf.setDrawColor(180, 180, 180);
-      pdf.setLineWidth(0.3);
-      pdf.line(margin, currentY - 5, pageWidth - margin, currentY - 5);
-      
-      pdf.setFontSize(8);
-      pdf.setFont('helvetica', 'normal');
-      pdf.setTextColor(100, 100, 100);
-      pdf.text(`${companySettings.company_name} - ${companySettings.company_description}`, pageWidth / 2, currentY, { align: 'center' });
-      
-      currentY += 4;
-      pdf.text(`${companySettings.address}, ${companySettings.city}`, pageWidth / 2, currentY, { align: 'center' });
-
-      // Save
-      const codeStamp = `${createdAt.getFullYear()}${pad(createdAt.getMonth()+1)}${pad(createdAt.getDate())}${pad(createdAt.getHours())}${pad(createdAt.getMinutes())}${pad(createdAt.getSeconds())}`;
-      const fileName = `FACT-${codeStamp}.pdf`;
-      pdf.save(fileName);
-
-      toast({
-        title: "Facture générée",
-        description: "La facture a été téléchargée avec succès"
-      });
-
-    } catch (error) {
-      console.error('Error printing invoice:', error);
-      toast({
-        title: "Erreur",
-        description: "Impossible de générer la facture",
-        variant: "destructive"
-      });
-    }
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('full_name')
+      .eq('user_id', user?.id)
+      .single();
+    
+    generateInvoice(
+      completedSale,
+      companySettings,
+      cart,
+      profile?.full_name || 'Vendeur'
+    );
   };
 
   const categories = [
@@ -1417,32 +1121,47 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
                     const itemTotal = item.actualPrice !== undefined ? item.actualPrice : (item.price * item.cartQuantity);
                     return (
                       <div key={item.id} className="flex items-center justify-between p-4 border rounded-lg">
-                        <div className="flex-1">
+                         <div className="flex-1">
                           <h5 className="font-medium">{item.name}</h5>
                           <p className="text-sm text-muted-foreground">
-                            {item.cartQuantity} {item.displayUnit || item.unit} = {formatAmount(itemTotal)}
+                            {item.category === 'fer' && item.bars_per_ton 
+                              ? item.sourceUnit === 'tonne' 
+                                ? `${item.cartQuantity} barres (≈ ${getTonnageLabel(barresToTonnage(item.cartQuantity, item.bars_per_ton))})`
+                                : item.cartQuantity % item.bars_per_ton === 0
+                                  ? `${item.cartQuantity} barres (= ${item.cartQuantity / item.bars_per_ton} tonne${item.cartQuantity / item.bars_per_ton > 1 ? 's' : ''})`
+                                  : `${item.cartQuantity} barres`
+                              : `${item.cartQuantity} ${item.displayUnit || item.unit}`
+                            } = {formatAmount(itemTotal)}
                           </p>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => updateQuantity(item.id, -1)}
-                          >
-                            <Minus className="w-3 h-3" />
-                          </Button>
-                          <span className="text-sm font-medium w-8 text-center">
-                            {item.cartQuantity}
-                          </span>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => updateQuantity(item.id, 1)}
-                            disabled={item.cartQuantity >= item.quantity}
-                          >
-                            <Plus className="w-3 h-3" />
-                          </Button>
-                        </div>
+                    <div className="flex items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => updateQuantity(item.id, -1)}
+                      >
+                        <Minus className="w-3 h-3" />
+                      </Button>
+                      <span className="text-sm font-medium w-8 text-center">
+                        {item.cartQuantity}
+                      </span>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => updateQuantity(item.id, 1)}
+                        disabled={item.cartQuantity >= item.quantity}
+                      >
+                        <Plus className="w-3 h-3" />
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="text-destructive hover:text-destructive hover:bg-destructive/10"
+                        onClick={() => removeFromCart(item.id)}
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </Button>
+                    </div>
                       </div>
                     );
                   })}
@@ -1631,14 +1350,28 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
             <div className="flex flex-col sm:flex-row gap-2 justify-center">
               {completedSale && (
                 <>
-                  <Button 
-                    onClick={printReceipt}
-                    variant="outline" 
-                    className="gap-2 w-full sm:w-auto"
-                  >
-                    <Printer className="w-4 h-4" />
-                    Imprimer Reçu Thermique
-                  </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button 
+                        variant="outline" 
+                        className="gap-2 w-full sm:w-auto"
+                      >
+                        <Printer className="w-4 h-4" />
+                        Imprimer Reçu Thermique
+                        <ChevronDown className="w-4 h-4 ml-1" />
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem onClick={printReceipt58mm}>
+                        <Printer className="w-4 h-4 mr-2" />
+                        Format 58 mm
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onClick={printReceipt80mm}>
+                        <Printer className="w-4 h-4 mr-2" />
+                        Format 80 mm
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                   <Button 
                     onClick={printInvoice}
                     variant="outline" 
@@ -1663,6 +1396,7 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
         if (!open) {
           setCustomQuantityDialog({open: false, product: null});
           setCustomQuantityValue('');
+          setQuantityUnit('barre'); // Reset unit
         }
       }}>
         <DialogContent>
@@ -1670,7 +1404,7 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
             <DialogTitle>
               {customQuantityDialog.product?.category === 'ceramique' 
                 ? 'Entrer la surface nécessaire' 
-                : 'Entrer le nombre de barres'}
+                : 'Entrer la quantité'}
             </DialogTitle>
           </DialogHeader>
           <div className="space-y-4">
@@ -1700,25 +1434,109 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
                     </p>
                     <p className="text-sm text-success">
                       Prix: {customQuantityDialog.product.prix_par_barre} HTG/barre
+                      {customQuantityDialog.product.bars_per_ton && (
+                        <span className="text-xs text-muted-foreground block">
+                          ({customQuantityDialog.product.bars_per_ton} barres/tonne)
+                        </span>
+                      )}
                     </p>
                   </>
                 )}
               </div>
             )}
+            
+            {/* Unit selector for iron products */}
+            {customQuantityDialog.product?.category === 'fer' && customQuantityDialog.product.bars_per_ton && (
+              <div className="space-y-2">
+                <Label>Unité</Label>
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={quantityUnit === 'barre' ? 'default' : 'outline'}
+                    onClick={() => setQuantityUnit('barre')}
+                    className="flex-1"
+                  >
+                    Barres
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={quantityUnit === 'tonne' ? 'default' : 'outline'}
+                    onClick={() => setQuantityUnit('tonne')}
+                    className="flex-1"
+                  >
+                    Tonnes
+                  </Button>
+                </div>
+              </div>
+            )}
+            
             <div className="space-y-2">
               <Label htmlFor="custom-quantity">
                 {customQuantityDialog.product?.category === 'ceramique' 
                   ? 'Surface nécessaire (m²)' 
-                  : 'Nombre de barres'}
+                  : customQuantityDialog.product?.category === 'fer'
+                    ? quantityUnit === 'barre' ? 'Quantité (barres)' : 'Quantité (tonnes)'
+                    : 'Quantité'}
               </Label>
+              
+              {/* Quick fraction buttons for iron (only when tonne is selected) */}
+              {customQuantityDialog.product?.category === 'fer' && quantityUnit === 'tonne' && (
+                <div className="grid grid-cols-4 gap-2 mb-3">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setCustomQuantityValue('0.25')}
+                    className="text-xs"
+                  >
+                    1/4 T
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setCustomQuantityValue('0.5')}
+                    className="text-xs"
+                  >
+                    1/2 T
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setCustomQuantityValue('0.75')}
+                    className="text-xs"
+                  >
+                    3/4 T
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setCustomQuantityValue('1')}
+                    className="text-xs"
+                  >
+                    1 T
+                  </Button>
+                </div>
+              )}
+              
               <Input
                 id="custom-quantity"
                 type="number"
-                step={customQuantityDialog.product?.category === 'ceramique' ? '0.01' : '1'}
+                step={customQuantityDialog.product?.category === 'fer' && quantityUnit === 'barre' ? '1' : '0.01'}
                 min="0"
                 value={customQuantityValue}
                 onChange={(e) => setCustomQuantityValue(e.target.value)}
-                placeholder={customQuantityDialog.product?.category === 'ceramique' ? 'Ex: 15.5' : 'Ex: 10'}
+                placeholder={
+                  customQuantityDialog.product?.category === 'ceramique' 
+                    ? 'Ex: 15.5' 
+                    : quantityUnit === 'barre' 
+                      ? 'Ex: 10' 
+                      : 'Ex: 0.5'
+                }
                 onKeyPress={(e) => {
                   if (e.key === 'Enter') {
                     handleCustomQuantitySubmit();
@@ -1735,6 +1553,27 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
                   )}
                 </p>
               )}
+              {customQuantityDialog.product?.category === 'fer' && customQuantityValue && customQuantityDialog.product.bars_per_ton && (
+                <p className="text-xs text-muted-foreground">
+                  {quantityUnit === 'tonne' ? (
+                    <>
+                      <span className="block font-medium">{getTonnageLabel(parseFloat(customQuantityValue))}</span>
+                      <span className="block">
+                        ≈ {tonnageToBarres(parseFloat(customQuantityValue), customQuantityDialog.product.bars_per_ton)} barres (arrondi)
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="block">{parseFloat(customQuantityValue)} barres</span>
+                      {parseFloat(customQuantityValue) % customQuantityDialog.product.bars_per_ton === 0 && (
+                        <span className="block">
+                          = {parseFloat(customQuantityValue) / customQuantityDialog.product.bars_per_ton} tonne{parseFloat(customQuantityValue) / customQuantityDialog.product.bars_per_ton > 1 ? 's' : ''}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </p>
+              )}
             </div>
             <div className="flex gap-2 justify-end">
               <Button 
@@ -1742,6 +1581,7 @@ export const SellerWorkflow = ({ onSaleComplete }: SellerWorkflowProps) => {
                 onClick={() => {
                   setCustomQuantityDialog({open: false, product: null});
                   setCustomQuantityValue('');
+                  setQuantityUnit('barre');
                 }}
               >
                 Annuler
