@@ -166,7 +166,7 @@ BEGIN
     'space_freed_mb', ROUND(size_before - size_after, 2),
     'cleaned_at', NOW()
   );
-  
+  -- Logger l'action de nettoyage
   INSERT INTO activity_logs (
     user_id,
     action_type,
@@ -180,7 +180,7 @@ BEGIN
     'Nettoyage automatique de la base de données',
     result::jsonb
   );
-  
+  -- Retourner le résultat
   RETURN result;
 END;
 $function$;
